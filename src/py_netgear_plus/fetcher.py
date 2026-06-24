@@ -204,19 +204,30 @@ class PageFetcher:
 
         # Some MS-series firmware returns HTTP 200 with an error payload when an
         # endpoint needs authentication. Treat that as unauthorized so callers
-        # retry after JSON REST login.
+        # retry after JSON REST login. If a bearer token was already present, it
+        # is stale or rejected, so clear it before the retry path logs in again.
         err_code = body.get("errCode")
-        if request_data is None and not self._bearer_token and err_code not in (
+        if request_data is None and err_code not in (
             None,
             0,
             "0",
         ):
-            _LOGGER.debug(
-                "[PageFetcher.json_request] JSON API endpoint %s returned errCode=%s "
-                "without a bearer token; retrying after login.",
-                url,
-                err_code,
-            )
+            if self._bearer_token:
+                _LOGGER.debug(
+                    "[PageFetcher.json_request] JSON API endpoint %s returned "
+                    "errCode=%s with a bearer token; clearing token and retrying "
+                    "after login.",
+                    url,
+                    err_code,
+                )
+                self.clear_bearer_token()
+            else:
+                _LOGGER.debug(
+                    "[PageFetcher.json_request] JSON API endpoint %s returned "
+                    "errCode=%s without a bearer token; retrying after login.",
+                    url,
+                    err_code,
+                )
             response.status_code = status_code_unauthorized
             return
 
@@ -313,6 +324,14 @@ class PageFetcher:
             requests.exceptions.ChunkedEncodingError,
         ) as error:
             raise PageFetcherConnectionError from error
+        if response.status_code == status_code_unauthorized and self._bearer_token:
+            _LOGGER.debug(
+                "[PageFetcher.json_request] JSON API endpoint %s returned HTTP %s "
+                "with a bearer token; clearing token before retry/login.",
+                url,
+                response.status_code,
+            )
+            self.clear_bearer_token()
         self._prepare_json_response(url, response, data)
         return response
 
