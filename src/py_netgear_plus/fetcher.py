@@ -26,6 +26,7 @@ status_code_ok = requests.codes.ok
 status_code_not_found = requests.codes.not_found
 status_code_no_response = requests.codes.no_response
 status_code_unauthorized = requests.codes.unauthorized
+COOKIELESS_RETRY_PAGES = {"PoEPortConfig.cgi", "getPoePortStatus.cgi"}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -431,6 +432,14 @@ class PageFetcher:
                 return False
         return True
 
+    def _should_retry_without_cookie(self, method: str, url: str) -> bool:
+        """Return True for known pages that may reject a cached login cookie."""
+        if not (self._cookie_name and self._cookie_content):
+            return False
+        if method.lower() != "get":
+            return False
+        return url.rsplit(sep="/", maxsplit=1)[-1] in COOKIELESS_RETRY_PAGES
+
     def request(
         self,
         method: str,
@@ -503,6 +512,32 @@ class PageFetcher:
             raise PageFetcherConnectionError from error
         except requests.exceptions.ChunkedEncodingError as error:
             raise PageFetcherConnectionError from error
+
+        if (
+            response.status_code != status_code_ok
+            and self._should_retry_without_cookie(method, url)
+        ):
+            retry_kwargs = {
+                data_key: data,
+                "allow_redirects": allow_redirects,
+                "timeout": timeout,
+            }
+            _LOGGER.debug(
+                "[PageFetcher.request] retrying %s %s without cookie after status %s",
+                method.upper(),
+                url,
+                response.status_code,
+            )
+            try:
+                retry_response = requests.request(method, url, **retry_kwargs)  # noqa: S113
+            except requests.exceptions.Timeout:
+                return response
+            except requests.exceptions.ConnectionError as error:
+                raise PageFetcherConnectionError from error
+            except requests.exceptions.ChunkedEncodingError as error:
+                raise PageFetcherConnectionError from error
+            if retry_response.status_code == status_code_ok:
+                response = retry_response
 
         # Session expired: refresh login cookie and try again
         if response.status_code == status_code_ok and not self._is_authenticated(
