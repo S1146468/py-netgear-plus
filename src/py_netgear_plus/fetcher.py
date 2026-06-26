@@ -26,7 +26,7 @@ status_code_ok = requests.codes.ok
 status_code_not_found = requests.codes.not_found
 status_code_no_response = requests.codes.no_response
 status_code_unauthorized = requests.codes.unauthorized
-COOKIELESS_RETRY_PAGES = {"PoEPortConfig.cgi", "getPoePortStatus.cgi"}
+OPTIONAL_POE_PAGES = {"PoEPortConfig.cgi", "getPoePortStatus.cgi"}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -432,13 +432,30 @@ class PageFetcher:
                 return False
         return True
 
-    def _should_retry_without_cookie(self, method: str, url: str) -> bool:
-        """Return True for known pages that may reject a cached login cookie."""
-        if not (self._cookie_name and self._cookie_content):
-            return False
+    def _is_optional_poe_page(self, method: str, url: str) -> bool:
+        """Return True for optional PoE pages that should not kill polling."""
         if method.lower() != "get":
             return False
-        return url.rsplit(sep="/", maxsplit=1)[-1] in COOKIELESS_RETRY_PAGES
+        return url.rsplit(sep="/", maxsplit=1)[-1] in OPTIONAL_POE_PAGES
+
+    def _empty_optional_poe_response(
+        self, response: Response | BaseResponse, method: str, url: str
+    ) -> Response | BaseResponse:
+        """Return an empty valid HTML response for unavailable optional PoE pages."""
+        if not self._is_optional_poe_page(method, url):
+            return response
+        _LOGGER.warning(
+            "[PageFetcher.request] optional PoE page %s failed with status %s; "
+            "continuing this poll without PoE values.",
+            url,
+            getattr(response, "status_code", None),
+        )
+        response.status_code = status_code_ok
+        if isinstance(response, Response):
+            response._content = b"<html></html>"  # noqa: SLF001
+        else:
+            response.content = b"<html></html>"
+        return response
 
     def request(
         self,
@@ -507,15 +524,18 @@ class PageFetcher:
         try:
             response = requests.request(method, url, **kwargs)  # noqa: S113
         except requests.exceptions.Timeout:
-            return response
+            return self._empty_optional_poe_response(response, method, url)
         except requests.exceptions.ConnectionError as error:
+            if self._is_optional_poe_page(method, url):
+                return self._empty_optional_poe_response(response, method, url)
             raise PageFetcherConnectionError from error
         except requests.exceptions.ChunkedEncodingError as error:
+            if self._is_optional_poe_page(method, url):
+                return self._empty_optional_poe_response(response, method, url)
             raise PageFetcherConnectionError from error
 
-        if (
-            response.status_code != status_code_ok
-            and self._should_retry_without_cookie(method, url)
+        if response.status_code != status_code_ok and self._is_optional_poe_page(
+            method, url
         ):
             retry_kwargs = {
                 data_key: data,
@@ -531,13 +551,15 @@ class PageFetcher:
             try:
                 retry_response = requests.request(method, url, **retry_kwargs)  # noqa: S113
             except requests.exceptions.Timeout:
-                return response
-            except requests.exceptions.ConnectionError as error:
-                raise PageFetcherConnectionError from error
-            except requests.exceptions.ChunkedEncodingError as error:
-                raise PageFetcherConnectionError from error
+                return self._empty_optional_poe_response(response, method, url)
+            except requests.exceptions.ConnectionError:
+                return self._empty_optional_poe_response(response, method, url)
+            except requests.exceptions.ChunkedEncodingError:
+                return self._empty_optional_poe_response(response, method, url)
             if retry_response.status_code == status_code_ok:
                 response = retry_response
+            else:
+                response = self._empty_optional_poe_response(retry_response, method, url)
 
         # Session expired: refresh login cookie and try again
         if response.status_code == status_code_ok and not self._is_authenticated(
