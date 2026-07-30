@@ -1,23 +1,22 @@
 name: Apply MS3xx bearer token refresh fix
 
 on:
-  push:
+  pull_request:
     branches:
-      - fix-ms3xx-bearer-token-refresh
+      - msjsondetect
 
 permissions:
   contents: write
 
 jobs:
   patch:
-    if: ${{ !contains(github.event.head_commit.message, 'Fix MS3xx bearer token refresh') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: fix-ms3xx-bearer-token-refresh
 
-      - name: Patch JSON API authentication
+      - name: Patch and validate
         shell: python
         run: |
           from pathlib import Path
@@ -25,65 +24,10 @@ jobs:
           path = Path("src/py_netgear_plus/__init__.py")
           source = path.read_text()
 
-          old = '''    def _json_api_login(self) -> bool:
-              """Login via JSON REST API (MS-series switches)."""
-              login_template = self.switch_model.LOGIN_TEMPLATE
-              login_url = login_template["url"].format(ip=self.host)
-              login_method = login_template["method"]
-              session_template = self.switch_model.LOGIN_SESSION_TEMPLATE
-              session_url = session_template["url"].format(ip=self.host)
-              session_method = session_template["method"]
-              try:
-                  response = self._page_fetcher.json_request(
-                      login_method,
-                      login_url,
-                      data={"password": self._password},
-                  )
-                  if not self._page_fetcher.has_ok_status(response):
-                      return False
-                  data = response.json()
-                  if data.get("errCode") != 0:
-                      return False
-                  token = data.get("token")
-                  session_id = data.get("id")
-                  if not token or not session_id:
-                      return False
-                  self._page_fetcher.set_bearer_token(token)
-                  response2 = self._page_fetcher.json_request(
-                      session_method,
-                      session_url,
-                      data={"id": session_id, "status": True},
-                  )
-                  if not self._page_fetcher.has_ok_status(response2):
-                      self._page_fetcher.clear_bearer_token()
-                      return False
-              except (PageFetcherConnectionError, ValueError, KeyError):
-                  return False
-              _LOGGER.info(
-                  "[NetgearSwitchConnector._json_api_login] "
-                  "JSON REST API login successful for IP=%s",
-                  self.host,
-              )
-              return True
+          start = source.index("    def _json_api_login(self) -> bool:\n")
+          end = source.index("    def _autodetect_json_api", start)
 
-          def _json_api_fetch(self, templates: list) -> Response | BaseResponse:
-              """Fetch a JSON REST API endpoint with retry on auth failure."""
-              for template in templates:
-                  url = template["url"].format(ip=self.host)
-                  method = template["method"]
-                  response = self._page_fetcher.json_request(method, url)
-                  if (
-                      response.status_code == status_code_unauthorized
-                      and self._json_api_login()
-                  ):
-                      response = self._page_fetcher.json_request(method, url)
-                  if self._page_fetcher.has_ok_status(response):
-                      return response
-              message = f"Failed to load any JSON API endpoint: {templates}"
-              raise PageNotLoadedError(message)
-          '''
-
-          new = '''    def _json_api_login(self) -> bool:
+          replacement = '''    def _json_api_login(self) -> bool:
               """Login via JSON REST API (MS-series switches)."""
               # Login must never include an expired or otherwise invalid bearer token.
               self._page_fetcher.clear_bearer_token()
@@ -162,14 +106,12 @@ jobs:
 
               message = f"Failed to load any JSON API endpoint: {templates}"
               raise PageNotLoadedError(message)
+
           '''
 
-          if old not in source:
-              raise SystemExit("Expected authentication block was not found; refusing to modify the file")
+          path.write_text(source[:start] + replacement + source[end:])
 
-          path.write_text(source.replace(old, new, 1))
-
-      - name: Validate and commit
+      - name: Commit fix
         run: |
           python -m py_compile src/py_netgear_plus/__init__.py
           git diff --check
