@@ -306,7 +306,9 @@ class PageFetcher:
         try:
             response = requests.request(method, url, **kwargs)  # noqa: S113
         except requests.exceptions.Timeout:
-            return BaseResponse()
+            response = BaseResponse()
+            response.status_code = status_code_no_response
+            return response
         except (
             requests.exceptions.ConnectionError,
             requests.exceptions.ChunkedEncodingError,

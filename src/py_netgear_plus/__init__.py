@@ -251,6 +251,15 @@ class NetgearSwitchConnector:
             method = template["method"]
             response = self._page_fetcher.json_request(method, url)
             if (
+                method.lower() == "get"
+                and response.status_code == status_code_no_response
+            ):
+                _LOGGER.debug(
+                    "[NetgearSwitchConnector._json_api_fetch] "
+                    "JSON REST API GET timed out; retrying once."
+                )
+                response = self._page_fetcher.json_request(method, url)
+            if (
                 response.status_code == status_code_unauthorized
                 and self._json_api_login()
             ):

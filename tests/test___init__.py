@@ -18,6 +18,8 @@ from py_netgear_plus.fetcher import (
     BaseResponse,
     PageFetcher,
     PageFetcherConnectionError,
+    PageNotLoadedError,
+    status_code_no_response,
     status_code_unauthorized,
 )
 from py_netgear_plus.models import (
@@ -944,6 +946,66 @@ def test_json_request_preserves_status_for_malformed_json() -> None:
         result = fetcher.json_request("get", "http://switch.test/api/ports")
 
     assert result.status_code == requests.codes.ok
+
+
+def test_json_request_marks_timeout_as_no_response() -> None:
+    """Preserve timeout identity for JSON request recovery."""
+    fetcher = PageFetcher("switch.test")
+
+    with patch(
+        "py_netgear_plus.fetcher.requests.request",
+        side_effect=requests.exceptions.Timeout,
+    ):
+        result = fetcher.json_request("get", "http://switch.test/api/ports")
+
+    assert result.status_code == status_code_no_response
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_fetch_retries_get_after_timeout(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Retry one timed-out JSON GET for each MS3xx model."""
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    timeout_response = BaseResponse()
+    timeout_response.status_code = status_code_no_response
+    success_response = JsonApiTestHelper.make_json_response(
+        Path(f"pages/{switch_model.MODEL_NAME}/0/ports.json")
+    )
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=[timeout_response, success_response],
+    ) as mock_json_request:
+        result = connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    assert result is success_response
+    assert mock_json_request.call_count == 2
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_fetch_stops_after_second_timeout(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Keep the JSON GET timeout retry bounded to one retry."""
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    timeout_response = BaseResponse()
+    timeout_response.status_code = status_code_no_response
+
+    with (
+        patch.object(
+            connector._page_fetcher,
+            "json_request",
+            return_value=timeout_response,
+        ) as mock_json_request,
+        pytest.raises(PageNotLoadedError),
+    ):
+        connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    assert mock_json_request.call_count == 2
 
 
 @pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
