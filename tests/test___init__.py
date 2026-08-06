@@ -1110,7 +1110,12 @@ def test_json_api_fetch_refreshes_active_session_every_minute(
         (
             status_code_unauthorized,
             {"errCode": 0},
-            "session refresh rejected: http_status=401",
+            "session refresh rejected: http_status=401 body_type=dict errCode=0",
+        ),
+        (
+            requests.codes.internal_server_error,
+            {"errCode": -7, "message": "not logged"},
+            "session refresh rejected: http_status=500 body_type=dict errCode=-7",
         ),
     ],
 )
@@ -1142,6 +1147,27 @@ def test_json_api_keepalive_rejects_unsuccessful_response(
     assert expected_log in caplog.text
 
 
+def test_json_api_keepalive_diagnostics_handle_non_json_error_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report only response shape when a failed session response is not JSON."""
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(MS308E())
+    connector._json_session_id = "active-session"
+    response = Mock(status_code=requests.codes.internal_server_error)
+    response.json.side_effect = ValueError
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        return_value=response,
+    ):
+        assert connector._json_api_keepalive(force=True) is False
+
+    assert "http_status=500 body_type=unavailable errCode=None" in caplog.text
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -1151,7 +1177,7 @@ def test_json_api_keepalive_rejects_unsuccessful_response(
             None,
             None,
             1,
-            "login rejected: http_status=401",
+            "login rejected: http_status=401 body_type=dict errCode=0",
         ),
         (
             requests.codes.ok,
@@ -1179,19 +1205,31 @@ def test_json_api_keepalive_rejects_unsuccessful_response(
         ),
         (
             requests.codes.ok,
-            {"errCode": 0, "token": "new", "id": "new-session"},
+            {
+                "errCode": 0,
+                "token": "new",
+                "id": "new-session",
+                "sessionmax": True,
+                "timeout": 120,
+            },
             status_code_unauthorized,
             {"errCode": 0},
             2,
-            "login session registration failed",
+            "login session registration failed: sessionmax=True timeout=120",
         ),
         (
             requests.codes.ok,
-            {"errCode": 0, "token": "new", "id": "new-session"},
+            {
+                "errCode": 0,
+                "token": "new",
+                "id": "new-session",
+                "sessionmax": False,
+                "timeout": 120,
+            },
             requests.codes.ok,
             {},
             2,
-            "login session registration failed",
+            "login session registration failed: sessionmax=False timeout=120",
         ),
     ],
 )
@@ -1265,6 +1303,55 @@ def test_json_api_login_diagnostics_do_not_log_sensitive_values(
         "private-switch.test",
         "private-password",
         "private-error-code",
+        "private-message",
+        "private-token",
+        "private-session",
+    ):
+        assert private_value not in caplog.text
+
+
+def test_json_api_session_registration_diagnostics_do_not_log_sensitive_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report registration metadata without logging arbitrary response values."""
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
+    connector = NetgearSwitchConnector(
+        host="private-switch.test", password="private-password"
+    )
+    connector._set_instance_attributes_by_model(MS305E())
+    login_response = JsonApiTestHelper.make_json_body_response(
+        {
+            "errCode": 0,
+            "token": "private-token",
+            "id": "private-session",
+            "sessionmax": "private-sessionmax",
+            "timeout": "private-timeout",
+        }
+    )
+    session_response = JsonApiTestHelper.make_json_body_response(
+        {
+            "errCode": "private-registration-code",
+            "message": "private-message",
+        },
+        requests.codes.internal_server_error,
+    )
+    caplog.clear()
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=[login_response, session_response],
+    ):
+        assert connector._json_api_login() is False
+
+    assert "http_status=500 body_type=dict errCode=<str>" in caplog.text
+    assert "sessionmax=<str> timeout=<str>" in caplog.text
+    for private_value in (
+        "private-switch.test",
+        "private-password",
+        "private-registration-code",
+        "private-sessionmax",
+        "private-timeout",
         "private-message",
         "private-token",
         "private-session",

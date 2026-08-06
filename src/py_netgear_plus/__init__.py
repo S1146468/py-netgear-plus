@@ -50,6 +50,31 @@ def _json_error_code_for_log(value: Any) -> int | str | None:
     return f"<{type(value).__name__}>"
 
 
+def _json_boolean_for_log(value: Any) -> bool | str:
+    """Return a diagnostic boolean without exposing arbitrary response text."""
+    if type(value) is bool:
+        return value
+    return f"<{type(value).__name__}>"
+
+
+def _json_integer_for_log(value: Any) -> int | str:
+    """Return a diagnostic integer without exposing arbitrary response text."""
+    if type(value) is int:
+        return value
+    return f"<{type(value).__name__}>"
+
+
+def _json_response_diagnostics(response: Any) -> tuple[str, int | str | None]:
+    """Return only the safe shape and error code from a JSON response."""
+    try:
+        data = response.json()
+    except (AttributeError, ValueError):
+        return "unavailable", None
+    if not isinstance(data, dict):
+        return type(data).__name__, None
+    return "dict", _json_error_code_for_log(data.get("errCode"))
+
+
 def _from_bytes_to_megabytes(v: float) -> float:
     bytes_to_mbytes = 1e-6
     return float(f"{round(v * bytes_to_mbytes, 2):.2f}")
@@ -201,10 +226,14 @@ class NetgearSwitchConnector:
                 data={"id": self._json_session_id, "status": True},
             )
             if not self._page_fetcher.has_ok_status(response):
+                body_type, err_code = _json_response_diagnostics(response)
                 _LOGGER.debug(
                     "[NetgearSwitchConnector._json_api_keepalive] "
-                    "JSON REST session refresh rejected: http_status=%s",
+                    "JSON REST session refresh rejected: http_status=%s "
+                    "body_type=%s errCode=%s",
                     getattr(response, "status_code", None),
+                    body_type,
+                    err_code,
                 )
                 return False
             data = response.json()
@@ -247,10 +276,14 @@ class NetgearSwitchConnector:
                 data={"password": self._password},
             )
             if not self._page_fetcher.has_ok_status(response):
+                body_type, err_code = _json_response_diagnostics(response)
                 _LOGGER.debug(
                     "[NetgearSwitchConnector._json_api_login] "
-                    "JSON REST login rejected: http_status=%s",
+                    "JSON REST login rejected: http_status=%s "
+                    "body_type=%s errCode=%s",
                     getattr(response, "status_code", None),
+                    body_type,
+                    err_code,
                 )
                 return False
             data = response.json()
@@ -289,7 +322,10 @@ class NetgearSwitchConnector:
             if not self._json_api_keepalive(force=True):
                 _LOGGER.debug(
                     "[NetgearSwitchConnector._json_api_login] "
-                    "JSON REST login session registration failed."
+                    "JSON REST login session registration failed: "
+                    "sessionmax=%s timeout=%s",
+                    _json_boolean_for_log(data.get("sessionmax")),
+                    _json_integer_for_log(data.get("timeout")),
                 )
                 self._clear_json_session()
                 return False
