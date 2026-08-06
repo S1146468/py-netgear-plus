@@ -209,19 +209,10 @@ class PageFetcher:
         # endpoint needs authentication. Treat that as unauthorized so callers
         # retry after JSON REST login.
         err_code = body.get("errCode")
-        if (
-            request_data is None
-            and not self._bearer_token
-            and err_code
-            not in (
-                None,
-                0,
-                "0",
-            )
-        ):
+        if request_data is None and err_code in (-2, "-2"):
             _LOGGER.debug(
                 "[PageFetcher.json_request] JSON API endpoint %s returned errCode=%s "
-                "without a bearer token; retrying after login.",
+                "indicating an expired or missing session; retrying after login.",
                 url,
                 err_code,
             )

@@ -32,6 +32,7 @@ __version__ = "0.6.4"
 
 DEFAULT_PAGE = "index.htm"
 MAX_AUTHENTICATION_FAILURES = 3
+JSON_API_SESSION_KEEPALIVE_INTERVAL = 60
 PORT_STATUS_CONNECTED = ["Aktiv", "Up", "UP", "CONNECTED"]
 PORT_MODUS_SPEED = ["Auto"]
 SWITCH_STATES = ["on", "off"]
@@ -123,6 +124,8 @@ class NetgearSwitchConnector:
         # Model page template param variables
         self._client_hash = None
         self._gambit = None
+        self._json_session_id: str | None = None
+        self._json_session_refreshed_at: float | None = None
 
         self._authentication_failure_count = 0
 
@@ -161,14 +164,50 @@ class NetgearSwitchConnector:
         """Return True if switch uses JSON REST API."""
         return getattr(self.switch_model, "API_TYPE", "") == "json_rest"
 
+    def _clear_json_session(self) -> None:
+        """Clear JSON REST API session state."""
+        self._page_fetcher.clear_bearer_token()
+        self._json_session_id = None
+        self._json_session_refreshed_at = None
+
+    def _json_api_keepalive(self, *, force: bool = False) -> bool:
+        """Refresh the active JSON REST API session when it is due."""
+        if not self._json_session_id:
+            return False
+        now = time.monotonic()
+        if (
+            not force
+            and self._json_session_refreshed_at is not None
+            and now - self._json_session_refreshed_at
+            < JSON_API_SESSION_KEEPALIVE_INTERVAL
+        ):
+            return True
+
+        session_template = self.switch_model.LOGIN_SESSION_TEMPLATE
+        session_url = session_template["url"].format(ip=self.host)
+        try:
+            response = self._page_fetcher.json_request(
+                session_template["method"],
+                session_url,
+                data={"id": self._json_session_id, "status": True},
+            )
+            if not self._page_fetcher.has_ok_status(response):
+                return False
+            data = response.json()
+        except (AttributeError, PageFetcherConnectionError, ValueError):
+            return False
+        if not isinstance(data, dict) or data.get("errCode") not in (0, "0"):
+            return False
+        self._json_session_refreshed_at = now
+        return True
+
     def _json_api_login(self) -> bool:
         """Login via JSON REST API (MS-series switches)."""
+        # Do not send an expired Bearer token with a new login request.
+        self._clear_json_session()
         login_template = self.switch_model.LOGIN_TEMPLATE
         login_url = login_template["url"].format(ip=self.host)
         login_method = login_template["method"]
-        session_template = self.switch_model.LOGIN_SESSION_TEMPLATE
-        session_url = session_template["url"].format(ip=self.host)
-        session_method = session_template["method"]
         try:
             response = self._page_fetcher.json_request(
                 login_method,
@@ -178,22 +217,24 @@ class NetgearSwitchConnector:
             if not self._page_fetcher.has_ok_status(response):
                 return False
             data = response.json()
-            if data.get("errCode") != 0:
+            if not isinstance(data, dict) or data.get("errCode") not in (0, "0"):
                 return False
             token = data.get("token")
             session_id = data.get("id")
-            if not token or not session_id:
+            if (
+                not isinstance(token, str)
+                or not token
+                or not isinstance(session_id, str)
+                or not session_id
+            ):
                 return False
             self._page_fetcher.set_bearer_token(token)
-            response2 = self._page_fetcher.json_request(
-                session_method,
-                session_url,
-                data={"id": session_id, "status": True},
-            )
-            if not self._page_fetcher.has_ok_status(response2):
-                self._page_fetcher.clear_bearer_token()
+            self._json_session_id = session_id
+            if not self._json_api_keepalive(force=True):
+                self._clear_json_session()
                 return False
-        except (PageFetcherConnectionError, ValueError, KeyError):
+        except (AttributeError, PageFetcherConnectionError, ValueError, KeyError):
+            self._clear_json_session()
             return False
         _LOGGER.info(
             "[NetgearSwitchConnector._json_api_login] "
@@ -203,7 +244,8 @@ class NetgearSwitchConnector:
         return True
 
     def _json_api_fetch(self, templates: list) -> Response | BaseResponse:
-        """Fetch a JSON REST API endpoint with retry on auth failure."""
+        """Fetch a JSON REST API endpoint with bounded session recovery."""
+        self._json_api_keepalive()
         for template in templates:
             url = template["url"].format(ip=self.host)
             method = template["method"]
@@ -473,7 +515,7 @@ class NetgearSwitchConnector:
         if not self.switch_model or self.switch_model.MODEL_NAME == "":
             self.autodetect_model()
         if self._is_json_api:
-            self._page_fetcher.clear_bearer_token()
+            self._clear_json_session()
             return True
         response = BaseResponse()
         for template in self.switch_model.LOGOUT_TEMPLATES:
