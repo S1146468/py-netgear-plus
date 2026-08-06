@@ -4,6 +4,7 @@ import logging
 import re
 import time
 from contextlib import suppress
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
@@ -225,6 +226,21 @@ class NetgearSwitchConnector:
                 session_url,
                 data={"id": self._json_session_id, "status": True},
             )
+            if (
+                force
+                and getattr(response, "status_code", None)
+                == HTTPStatus.INTERNAL_SERVER_ERROR
+            ):
+                _LOGGER.debug(
+                    "[NetgearSwitchConnector._json_api_keepalive] "
+                    "JSON REST session registration returned HTTP 500; "
+                    "retrying once."
+                )
+                response = self._page_fetcher.json_request(
+                    session_template["method"],
+                    session_url,
+                    data={"id": self._json_session_id, "status": True},
+                )
             if not self._page_fetcher.has_ok_status(response):
                 body_type, err_code = _json_response_diagnostics(response)
                 _LOGGER.debug(
