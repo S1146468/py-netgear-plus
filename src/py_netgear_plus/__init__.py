@@ -41,6 +41,15 @@ FLOW_CONTROL = ["Enable", "Disable"]
 _LOGGER = logging.getLogger(__name__)
 
 
+def _json_error_code_for_log(value: Any) -> int | str | None:
+    """Return a diagnostic error code without exposing arbitrary response text."""
+    if value is None or type(value) is int:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"-?\d{1,10}", value):
+        return value
+    return f"<{type(value).__name__}>"
+
+
 def _from_bytes_to_megabytes(v: float) -> float:
     bytes_to_mbytes = 1e-6
     return float(f"{round(v * bytes_to_mbytes, 2):.2f}")
@@ -192,11 +201,34 @@ class NetgearSwitchConnector:
                 data={"id": self._json_session_id, "status": True},
             )
             if not self._page_fetcher.has_ok_status(response):
+                _LOGGER.debug(
+                    "[NetgearSwitchConnector._json_api_keepalive] "
+                    "JSON REST session refresh rejected: http_status=%s",
+                    getattr(response, "status_code", None),
+                )
                 return False
             data = response.json()
-        except (AttributeError, PageFetcherConnectionError, ValueError):
+        except (AttributeError, PageFetcherConnectionError, ValueError) as error:
+            _LOGGER.debug(
+                "[NetgearSwitchConnector._json_api_keepalive] "
+                "JSON REST session refresh failed: exception=%s",
+                type(error).__name__,
+            )
             return False
         if not isinstance(data, dict) or data.get("errCode") not in (0, "0"):
+            if not isinstance(data, dict):
+                _LOGGER.debug(
+                    "[NetgearSwitchConnector._json_api_keepalive] "
+                    "JSON REST session refresh returned an invalid body: "
+                    "body_type=%s",
+                    type(data).__name__,
+                )
+            else:
+                _LOGGER.debug(
+                    "[NetgearSwitchConnector._json_api_keepalive] "
+                    "JSON REST session refresh rejected: errCode=%s",
+                    _json_error_code_for_log(data.get("errCode")),
+                )
             return False
         self._json_session_refreshed_at = now
         return True
@@ -215,9 +247,26 @@ class NetgearSwitchConnector:
                 data={"password": self._password},
             )
             if not self._page_fetcher.has_ok_status(response):
+                _LOGGER.debug(
+                    "[NetgearSwitchConnector._json_api_login] "
+                    "JSON REST login rejected: http_status=%s",
+                    getattr(response, "status_code", None),
+                )
                 return False
             data = response.json()
             if not isinstance(data, dict) or data.get("errCode") not in (0, "0"):
+                if not isinstance(data, dict):
+                    _LOGGER.debug(
+                        "[NetgearSwitchConnector._json_api_login] "
+                        "JSON REST login returned an invalid body: body_type=%s",
+                        type(data).__name__,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "[NetgearSwitchConnector._json_api_login] "
+                        "JSON REST login rejected: errCode=%s",
+                        _json_error_code_for_log(data.get("errCode")),
+                    )
                 return False
             token = data.get("token")
             session_id = data.get("id")
@@ -227,13 +276,34 @@ class NetgearSwitchConnector:
                 or not isinstance(session_id, str)
                 or not session_id
             ):
+                _LOGGER.debug(
+                    "[NetgearSwitchConnector._json_api_login] "
+                    "JSON REST login response omitted required credentials: "
+                    "valid_token=%s valid_session_id=%s",
+                    isinstance(token, str) and bool(token),
+                    isinstance(session_id, str) and bool(session_id),
+                )
                 return False
             self._page_fetcher.set_bearer_token(token)
             self._json_session_id = session_id
             if not self._json_api_keepalive(force=True):
+                _LOGGER.debug(
+                    "[NetgearSwitchConnector._json_api_login] "
+                    "JSON REST login session registration failed."
+                )
                 self._clear_json_session()
                 return False
-        except (AttributeError, PageFetcherConnectionError, ValueError, KeyError):
+        except (
+            AttributeError,
+            PageFetcherConnectionError,
+            ValueError,
+            KeyError,
+        ) as error:
+            _LOGGER.debug(
+                "[NetgearSwitchConnector._json_api_login] "
+                "JSON REST login failed: exception=%s",
+                type(error).__name__,
+            )
             self._clear_json_session()
             return False
         _LOGGER.info(

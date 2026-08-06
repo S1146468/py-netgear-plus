@@ -1,6 +1,7 @@
 """Unit tests for the py_netgear_plus __init__ module."""
 
 import json
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, call, patch
@@ -1097,18 +1098,30 @@ def test_json_api_fetch_refreshes_active_session_every_minute(
 
 
 @pytest.mark.parametrize(
-    ("status_code", "body"),
+    ("status_code", "body", "expected_log"),
     [
-        (requests.codes.ok, {}),
-        (requests.codes.ok, []),
-        (requests.codes.ok, {"errCode": -2}),
-        (status_code_unauthorized, {"errCode": 0}),
+        (requests.codes.ok, {}, "session refresh rejected: errCode=None"),
+        (
+            requests.codes.ok,
+            [],
+            "session refresh returned an invalid body: body_type=list",
+        ),
+        (requests.codes.ok, {"errCode": -2}, "session refresh rejected: errCode=-2"),
+        (
+            status_code_unauthorized,
+            {"errCode": 0},
+            "session refresh rejected: http_status=401",
+        ),
     ],
 )
 def test_json_api_keepalive_rejects_unsuccessful_response(
-    status_code: int, body: object
+    caplog: pytest.LogCaptureFixture,
+    status_code: int,
+    body: object,
+    expected_log: str,
 ) -> None:
     """Do not mark malformed or failed keepalive responses as successful."""
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
     connector = NetgearSwitchConnector(host="switch.test", password="password")
     connector._set_instance_attributes_by_model(MS305E())
     connector._json_session_id = "active-session"
@@ -1126,21 +1139,51 @@ def test_json_api_keepalive_rejects_unsuccessful_response(
         assert connector._json_api_keepalive() is False
 
     assert connector._json_session_refreshed_at == 0
+    assert expected_log in caplog.text
 
 
 @pytest.mark.parametrize(
-    ("login_status", "login_body", "session_status", "session_body", "call_count"),
+    "case",
     [
-        (status_code_unauthorized, {"errCode": 0}, None, None, 1),
-        (requests.codes.ok, [], None, None, 1),
-        (requests.codes.ok, {"errCode": -2}, None, None, 1),
-        (requests.codes.ok, {"errCode": 0, "token": "new"}, None, None, 1),
+        (
+            status_code_unauthorized,
+            {"errCode": 0},
+            None,
+            None,
+            1,
+            "login rejected: http_status=401",
+        ),
+        (
+            requests.codes.ok,
+            [],
+            None,
+            None,
+            1,
+            "login returned an invalid body: body_type=list",
+        ),
+        (
+            requests.codes.ok,
+            {"errCode": -2},
+            None,
+            None,
+            1,
+            "login rejected: errCode=-2",
+        ),
+        (
+            requests.codes.ok,
+            {"errCode": 0, "token": "new"},
+            None,
+            None,
+            1,
+            "valid_token=True valid_session_id=False",
+        ),
         (
             requests.codes.ok,
             {"errCode": 0, "token": "new", "id": "new-session"},
             status_code_unauthorized,
             {"errCode": 0},
             2,
+            "login session registration failed",
         ),
         (
             requests.codes.ok,
@@ -1148,17 +1191,24 @@ def test_json_api_keepalive_rejects_unsuccessful_response(
             requests.codes.ok,
             {},
             2,
+            "login session registration failed",
         ),
     ],
 )
 def test_json_api_login_clears_state_after_unsuccessful_response(
-    login_status: int,
-    login_body: object,
-    session_status: int | None,
-    session_body: object,
-    call_count: int,
+    caplog: pytest.LogCaptureFixture,
+    case: tuple[int, object, int | None, object, int, str],
 ) -> None:
     """Reject malformed or failed login steps without retaining session state."""
+    (
+        login_status,
+        login_body,
+        session_status,
+        session_body,
+        call_count,
+        expected_log,
+    ) = case
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
     connector = NetgearSwitchConnector(host="switch.test", password="password")
     connector._set_instance_attributes_by_model(MS305E())
     connector._page_fetcher.set_bearer_token("expired")
@@ -1181,6 +1231,45 @@ def test_json_api_login_clears_state_after_unsuccessful_response(
     assert connector._page_fetcher.has_bearer_token() is False
     assert connector._json_session_id is None
     assert connector._json_session_refreshed_at is None
+    assert expected_log in caplog.text
+
+
+def test_json_api_login_diagnostics_do_not_log_sensitive_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report a login failure without logging request or response secrets."""
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
+    connector = NetgearSwitchConnector(
+        host="private-switch.test", password="private-password"
+    )
+    connector._set_instance_attributes_by_model(MS308E())
+    response = JsonApiTestHelper.make_json_body_response(
+        {
+            "errCode": "private-error-code",
+            "message": "private-message",
+            "token": "private-token",
+            "id": "private-session",
+        }
+    )
+    caplog.clear()
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        return_value=response,
+    ):
+        assert connector._json_api_login() is False
+
+    assert "login rejected: errCode=<str>" in caplog.text
+    for private_value in (
+        "private-switch.test",
+        "private-password",
+        "private-error-code",
+        "private-message",
+        "private-token",
+        "private-session",
+    ):
+        assert private_value not in caplog.text
 
 
 @pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
