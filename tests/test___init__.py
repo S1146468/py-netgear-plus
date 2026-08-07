@@ -987,10 +987,34 @@ def test_json_api_fetch_retries_get_after_timeout(
 
 
 @pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
-def test_json_api_fetch_stops_after_second_timeout(
+def test_json_api_fetch_retries_get_after_second_timeout(
     switch_model: type[AutodetectedSwitchModel],
 ) -> None:
-    """Keep the JSON GET timeout retry bounded to one retry."""
+    """Recover when the first two JSON GET attempts time out."""
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    timeout_response = BaseResponse()
+    timeout_response.status_code = status_code_no_response
+    success_response = JsonApiTestHelper.make_json_response(
+        Path(f"pages/{switch_model.MODEL_NAME}/0/ports.json")
+    )
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=[timeout_response, timeout_response, success_response],
+    ) as mock_json_request:
+        result = connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    assert result is success_response
+    assert mock_json_request.call_count == 3
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_fetch_stops_after_third_timeout(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Keep the JSON GET timeout recovery bounded to three attempts."""
     connector = NetgearSwitchConnector(host="switch.test", password="password")
     connector._set_instance_attributes_by_model(switch_model())
     timeout_response = BaseResponse()
@@ -1006,7 +1030,7 @@ def test_json_api_fetch_stops_after_second_timeout(
     ):
         connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
 
-    assert mock_json_request.call_count == 2
+    assert mock_json_request.call_count == 3
 
 
 @pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
