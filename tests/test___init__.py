@@ -949,17 +949,47 @@ def test_json_request_preserves_status_for_malformed_json() -> None:
     assert result.status_code == requests.codes.ok
 
 
-def test_json_request_marks_timeout_as_no_response() -> None:
-    """Preserve timeout identity for JSON request recovery."""
-    fetcher = PageFetcher("switch.test")
+@pytest.mark.parametrize(
+    ("timeout_error", "expected_phase"),
+    [
+        (requests.exceptions.ConnectTimeout(), "connect"),
+        (requests.exceptions.ReadTimeout(), "read"),
+        (requests.exceptions.Timeout(), "unknown"),
+    ],
+)
+def test_json_request_logs_safe_timeout_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+    timeout_error: requests.exceptions.Timeout,
+    expected_phase: str,
+) -> None:
+    """Report timeout type without exposing the host or query parameters."""
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus.fetcher")
+    fetcher = PageFetcher("private-switch.test")
+    caplog.clear()
 
-    with patch(
-        "py_netgear_plus.fetcher.requests.request",
-        side_effect=requests.exceptions.Timeout,
+    with (
+        patch(
+            "py_netgear_plus.fetcher.requests.request",
+            side_effect=timeout_error,
+        ),
+        patch(
+            "py_netgear_plus.fetcher.time.perf_counter",
+            side_effect=[10.0, 25.25],
+        ),
     ):
-        result = fetcher.json_request("get", "http://switch.test/api/ports")
+        result = fetcher.json_request(
+            "get",
+            "http://private-switch.test/api/ports?view=private-query",
+        )
 
     assert result.status_code == status_code_no_response
+    assert (
+        "JSON REST request timed out: "
+        f"phase={expected_phase} exception_type={type(timeout_error).__name__} "
+        "method=GET endpoint=/api/ports elapsed=15.250s" in caplog.text
+    )
+    assert "private-switch.test" not in caplog.text
+    assert "private-query" not in caplog.text
 
 
 @pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)

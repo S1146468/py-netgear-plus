@@ -3,10 +3,12 @@
 import json
 import logging
 import re
+import time
 from collections.abc import Iterator
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 import requests.cookies
@@ -303,9 +305,25 @@ class PageFetcher:
         if data is not None:
             headers["Content-Type"] = "text/plain;charset=UTF-8"
             kwargs["data"] = json.dumps(data, separators=(",", ":"))
+        request_started_at = time.perf_counter()
         try:
             response = requests.request(method, url, **kwargs)  # noqa: S113
-        except requests.exceptions.Timeout:
+        except requests.exceptions.Timeout as error:
+            if isinstance(error, requests.exceptions.ConnectTimeout):
+                timeout_phase = "connect"
+            elif isinstance(error, requests.exceptions.ReadTimeout):
+                timeout_phase = "read"
+            else:
+                timeout_phase = "unknown"
+            _LOGGER.debug(
+                "[PageFetcher.json_request] JSON REST request timed out: "
+                "phase=%s exception_type=%s method=%s endpoint=%s elapsed=%.3fs",
+                timeout_phase,
+                type(error).__name__,
+                method.upper(),
+                urlsplit(url).path or "/",
+                time.perf_counter() - request_started_at,
+            )
             response = BaseResponse()
             response.status_code = status_code_no_response
             return response
