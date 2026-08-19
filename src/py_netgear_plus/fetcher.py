@@ -165,6 +165,39 @@ class PageFetcher:
         """Clear Bearer token."""
         self._bearer_token = None
 
+    def _parse_json_body(
+        self, response: Response | BaseResponse
+    ) -> dict[str, Any] | None:
+        """Return response JSON when it is a dictionary."""
+        try:
+            body = response.json()
+        except (AttributeError, ValueError):
+            return None
+        if not isinstance(body, dict):
+            return None
+        return body
+
+    def _prepare_json_response(
+        self, url: str, response: Response | BaseResponse, request_data: Any = None
+    ) -> None:
+        """Translate an expired JSON API session into an authentication retry."""
+        body = self._parse_json_body(response)
+        if body is None:
+            return
+
+        # Some MS-series firmware returns HTTP 200 with an error payload when an
+        # endpoint needs authentication. Treat that as unauthorized so callers
+        # retry after JSON REST login.
+        err_code = body.get("errCode")
+        if request_data is None and err_code in (-2, "-2"):
+            _LOGGER.debug(
+                "[PageFetcher.json_request] JSON API endpoint %s returned errCode=%s "
+                "indicating an expired or missing session; retrying after login.",
+                url,
+                err_code,
+            )
+            response.status_code = status_code_unauthorized
+
     def json_request(
         self,
         method: str,
@@ -173,7 +206,9 @@ class PageFetcher:
     ) -> Response | BaseResponse:
         """Make a JSON REST API request with optional Bearer token auth."""
         if self.offline_mode:
-            return self.get_page_from_file(url)
+            response = self.get_page_from_file(url)
+            self._prepare_json_response(url, response, data)
+            return response
         headers = {
             "Accept": "application/json, text/plain, */*",
         }
@@ -189,12 +224,15 @@ class PageFetcher:
         try:
             response = requests.request(method, url, **kwargs)  # noqa: S113
         except requests.exceptions.Timeout:
-            return BaseResponse()
+            response = BaseResponse()
+            response.status_code = status_code_no_response
+            return response
         except (
             requests.exceptions.ConnectionError,
             requests.exceptions.ChunkedEncodingError,
         ) as error:
             raise PageFetcherConnectionError from error
+        self._prepare_json_response(url, response, data)
         return response
 
     def get_page_from_file(self, url: str) -> BaseResponse:

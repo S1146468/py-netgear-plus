@@ -1,9 +1,10 @@
 """Unit tests for the py_netgear_plus __init__ module."""
 
 import json
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import requests
@@ -13,7 +14,15 @@ from py_netgear_plus import (
     NetgearSwitchConnector,
     _from_bytes_to_megabytes,
 )
-from py_netgear_plus.fetcher import URL_REQUEST_TIMEOUT, BaseResponse
+from py_netgear_plus.fetcher import (
+    URL_REQUEST_TIMEOUT,
+    BaseResponse,
+    PageFetcher,
+    PageFetcherConnectionError,
+    PageNotLoadedError,
+    status_code_no_response,
+    status_code_unauthorized,
+)
 from py_netgear_plus.models import (
     GS105PE,
     GS110EMX,
@@ -860,6 +869,16 @@ class JsonApiTestHelper:
         resp.json.return_value = json.loads(content)
         return resp
 
+    @staticmethod
+    def make_json_body_response(
+        body: object, status_code: int = requests.codes.ok
+    ) -> Mock:
+        """Create a mock response from an inline sanitized JSON body."""
+        resp = Mock()
+        resp.status_code = status_code
+        resp.json.return_value = body
+        return resp
+
     def mock_json_request(self, method: str, url: str, **kwargs: dict) -> Mock:  # noqa: ARG002
         """Mock json_request based on URL."""
         if "/api/system/status" in url:
@@ -885,6 +904,647 @@ JSON_API_MODELS = [
     (MS305E, 5),
     (MS308E, 8),
 ]
+JSON_API_MODEL_CLASSES = [switch_model for switch_model, _ in JSON_API_MODELS]
+
+
+@pytest.mark.parametrize(
+    ("has_bearer_token", "err_code", "expected_status"),
+    [
+        (True, -2, status_code_unauthorized),
+        (True, "-2", status_code_unauthorized),
+        (False, -2, status_code_unauthorized),
+        (False, 0, requests.codes.ok),
+        (False, -3, requests.codes.ok),
+    ],
+)
+def test_json_request_recognizes_authentication_error(
+    has_bearer_token: bool,  # noqa: FBT001
+    err_code: int | str,
+    expected_status: int,
+) -> None:
+    """Recognize only the observed JSON authentication error code."""
+    fetcher = PageFetcher("switch.test")
+    if has_bearer_token:
+        fetcher.set_bearer_token("expired")
+    response = Mock()
+    response.status_code = requests.codes.ok
+    response.json.return_value = {"errCode": err_code}
+
+    with patch("py_netgear_plus.fetcher.requests.request", return_value=response):
+        result = fetcher.json_request("get", "http://switch.test/api/ports")
+
+    assert result.status_code == expected_status
+
+
+def test_json_request_preserves_status_for_malformed_json() -> None:
+    """Do not reinterpret malformed response bodies as authentication errors."""
+    fetcher = PageFetcher("switch.test")
+    response = Mock()
+    response.status_code = requests.codes.ok
+    response.json.side_effect = ValueError
+
+    with patch("py_netgear_plus.fetcher.requests.request", return_value=response):
+        result = fetcher.json_request("get", "http://switch.test/api/ports")
+
+    assert result.status_code == requests.codes.ok
+
+
+def test_json_request_marks_timeout_as_no_response() -> None:
+    """Preserve timeout identity for JSON request recovery."""
+    fetcher = PageFetcher("switch.test")
+
+    with patch(
+        "py_netgear_plus.fetcher.requests.request",
+        side_effect=requests.exceptions.Timeout,
+    ):
+        result = fetcher.json_request("get", "http://switch.test/api/ports")
+
+    assert result.status_code == status_code_no_response
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_fetch_retries_get_after_timeout(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Retry one timed-out JSON GET for each MS3xx model."""
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    timeout_response = BaseResponse()
+    timeout_response.status_code = status_code_no_response
+    success_response = JsonApiTestHelper.make_json_response(
+        Path(f"pages/{switch_model.MODEL_NAME}/0/ports.json")
+    )
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=[timeout_response, success_response],
+    ) as mock_json_request:
+        result = connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    assert result is success_response
+    assert mock_json_request.call_count == 2
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_fetch_retries_get_after_second_timeout(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Recover when the first two JSON GET attempts time out."""
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    timeout_response = BaseResponse()
+    timeout_response.status_code = status_code_no_response
+    success_response = JsonApiTestHelper.make_json_response(
+        Path(f"pages/{switch_model.MODEL_NAME}/0/ports.json")
+    )
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=[timeout_response, timeout_response, success_response],
+    ) as mock_json_request:
+        result = connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    assert result is success_response
+    assert mock_json_request.call_count == 3
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_fetch_stops_after_third_timeout(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Keep the JSON GET timeout recovery bounded to three attempts."""
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    timeout_response = BaseResponse()
+    timeout_response.status_code = status_code_no_response
+
+    with (
+        patch.object(
+            connector._page_fetcher,
+            "json_request",
+            return_value=timeout_response,
+        ) as mock_json_request,
+        pytest.raises(PageNotLoadedError),
+    ):
+        connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    assert mock_json_request.call_count == 3
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_fetch_clears_expired_token_before_login(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Renew an expired MS3xx session without sending its stale token."""
+    helper = JsonApiTestHelper(switch_model.MODEL_NAME)
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    connector._page_fetcher.set_bearer_token("expired")
+    unauthorized_response = Mock()
+    unauthorized_response.status_code = status_code_unauthorized
+    port_response = helper.make_json_response(helper.data_dir / "0" / "ports.json")
+    port_requests = 0
+
+    def mock_json_request(method: str, url: str, **kwargs: dict) -> Mock:  # noqa: ARG001
+        nonlocal port_requests
+        if "/api/system/login" in url:
+            assert connector._page_fetcher.has_bearer_token() is False
+            return helper.make_json_response(helper.data_dir / "login.json")
+        if "/api/login_session" in url:
+            assert connector._page_fetcher.has_bearer_token() is True
+            return helper.make_json_response(helper.data_dir / "login_session.json")
+        if "/api/ports" in url:
+            port_requests += 1
+            if port_requests == 1:
+                return unauthorized_response
+            return port_response
+        pytest.fail(f"Unexpected JSON API URL: {url}")
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=mock_json_request,
+    ):
+        result = connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    assert result is port_response
+    assert port_requests == 2
+    assert connector._page_fetcher.has_bearer_token() is True
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_fetch_recovers_after_session_registration_http_500(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Recover the observed expired-session and registration failure sequence."""
+    helper = JsonApiTestHelper(switch_model.MODEL_NAME)
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    connector._page_fetcher.set_bearer_token("expired")
+    unauthorized_response = Mock(status_code=status_code_unauthorized)
+    login_response = helper.make_json_response(helper.data_dir / "login.json")
+    session_id = login_response.json.return_value["id"]
+    server_error = Mock(status_code=requests.codes.internal_server_error)
+    server_error.json.side_effect = ValueError
+    session_response = helper.make_json_response(helper.data_dir / "login_session.json")
+    port_response = helper.make_json_response(helper.data_dir / "0" / "ports.json")
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=[
+            unauthorized_response,
+            login_response,
+            server_error,
+            session_response,
+            port_response,
+        ],
+    ) as mock_json_request:
+        result = connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    assert result is port_response
+    assert mock_json_request.call_args_list == [
+        call("get", "http://switch.test/api/ports"),
+        call(
+            "patch",
+            "http://switch.test/api/system/login",
+            data={"password": "password"},
+        ),
+        call(
+            "post",
+            "http://switch.test/api/login_session",
+            data={"id": session_id, "status": True},
+        ),
+        call(
+            "post",
+            "http://switch.test/api/login_session",
+            data={"id": session_id, "status": True},
+        ),
+        call("get", "http://switch.test/api/ports"),
+    ]
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_fetch_refreshes_active_session_every_minute(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Refresh the same active session at the cadence observed on both switches."""
+    helper = JsonApiTestHelper(switch_model.MODEL_NAME)
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    connector._json_session_id = "active-session"
+    connector._json_session_refreshed_at = 0
+    port_response = helper.make_json_response(helper.data_dir / "0" / "ports.json")
+    session_response = helper.make_json_response(helper.data_dir / "login_session.json")
+
+    with (
+        patch("py_netgear_plus.time.monotonic", return_value=59),
+        patch.object(
+            connector._page_fetcher,
+            "json_request",
+            return_value=port_response,
+        ) as mock_json_request,
+    ):
+        connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    mock_json_request.assert_called_once_with("get", "http://switch.test/api/ports")
+
+    with (
+        patch("py_netgear_plus.time.monotonic", return_value=60),
+        patch.object(
+            connector._page_fetcher,
+            "json_request",
+            side_effect=[session_response, port_response],
+        ) as mock_json_request,
+    ):
+        result = connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    assert result is port_response
+    assert connector._json_session_refreshed_at == 60
+    assert mock_json_request.call_args_list == [
+        call(
+            "post",
+            "http://switch.test/api/login_session",
+            data={"id": "active-session", "status": True},
+        ),
+        call("get", "http://switch.test/api/ports"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body", "expected_log"),
+    [
+        (requests.codes.ok, {}, "session refresh rejected: errCode=None"),
+        (
+            requests.codes.ok,
+            [],
+            "session refresh returned an invalid body: body_type=list",
+        ),
+        (requests.codes.ok, {"errCode": -2}, "session refresh rejected: errCode=-2"),
+        (
+            status_code_unauthorized,
+            {"errCode": 0},
+            "session refresh rejected: http_status=401 body_type=dict errCode=0",
+        ),
+        (
+            requests.codes.internal_server_error,
+            {"errCode": -7, "message": "not logged"},
+            "session refresh rejected: http_status=500 body_type=dict errCode=-7",
+        ),
+    ],
+)
+def test_json_api_keepalive_rejects_unsuccessful_response(
+    caplog: pytest.LogCaptureFixture,
+    status_code: int,
+    body: object,
+    expected_log: str,
+) -> None:
+    """Do not mark malformed or failed keepalive responses as successful."""
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(MS305E())
+    connector._json_session_id = "active-session"
+    connector._json_session_refreshed_at = 0
+    response = JsonApiTestHelper.make_json_body_response(body, status_code)
+
+    with (
+        patch("py_netgear_plus.time.monotonic", return_value=60),
+        patch.object(
+            connector._page_fetcher,
+            "json_request",
+            return_value=response,
+        ) as mock_json_request,
+    ):
+        assert connector._json_api_keepalive() is False
+
+    assert mock_json_request.call_count == 1
+    assert connector._json_session_refreshed_at == 0
+    assert expected_log in caplog.text
+
+
+def test_json_api_keepalive_diagnostics_handle_non_json_error_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report only response shape when a failed session response is not JSON."""
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(MS308E())
+    connector._json_session_id = "active-session"
+    response = Mock(status_code=requests.codes.internal_server_error)
+    response.json.side_effect = ValueError
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        return_value=response,
+    ):
+        assert connector._json_api_keepalive(force=True) is False
+
+    assert "http_status=500 body_type=unavailable errCode=None" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (
+            status_code_unauthorized,
+            {"errCode": 0},
+            None,
+            None,
+            1,
+            "login rejected: http_status=401 body_type=dict errCode=0",
+        ),
+        (
+            requests.codes.ok,
+            [],
+            None,
+            None,
+            1,
+            "login returned an invalid body: body_type=list",
+        ),
+        (
+            requests.codes.ok,
+            {"errCode": -2},
+            None,
+            None,
+            1,
+            "login rejected: errCode=-2",
+        ),
+        (
+            requests.codes.ok,
+            {"errCode": 0, "token": "new"},
+            None,
+            None,
+            1,
+            "valid_token=True valid_session_id=False",
+        ),
+        (
+            requests.codes.ok,
+            {
+                "errCode": 0,
+                "token": "new",
+                "id": "new-session",
+                "sessionmax": True,
+                "timeout": 120,
+            },
+            status_code_unauthorized,
+            {"errCode": 0},
+            2,
+            "login session registration failed: sessionmax=True timeout=120",
+        ),
+        (
+            requests.codes.ok,
+            {
+                "errCode": 0,
+                "token": "new",
+                "id": "new-session",
+                "sessionmax": False,
+                "timeout": 120,
+            },
+            requests.codes.ok,
+            {},
+            2,
+            "login session registration failed: sessionmax=False timeout=120",
+        ),
+    ],
+)
+def test_json_api_login_clears_state_after_unsuccessful_response(
+    caplog: pytest.LogCaptureFixture,
+    case: tuple[int, object, int | None, object, int, str],
+) -> None:
+    """Reject malformed or failed login steps without retaining session state."""
+    (
+        login_status,
+        login_body,
+        session_status,
+        session_body,
+        call_count,
+        expected_log,
+    ) = case
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(MS305E())
+    connector._page_fetcher.set_bearer_token("expired")
+    connector._json_session_id = "expired-session"
+    connector._json_session_refreshed_at = 0
+    responses = [JsonApiTestHelper.make_json_body_response(login_body, login_status)]
+    if session_status is not None:
+        responses.append(
+            JsonApiTestHelper.make_json_body_response(session_body, session_status)
+        )
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=responses,
+    ) as mock_json_request:
+        assert connector._json_api_login() is False
+
+    assert mock_json_request.call_count == call_count
+    assert connector._page_fetcher.has_bearer_token() is False
+    assert connector._json_session_id is None
+    assert connector._json_session_refreshed_at is None
+    assert expected_log in caplog.text
+
+
+def test_json_api_login_diagnostics_do_not_log_sensitive_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report a login failure without logging request or response secrets."""
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
+    connector = NetgearSwitchConnector(
+        host="private-switch.test", password="private-password"
+    )
+    connector._set_instance_attributes_by_model(MS308E())
+    response = JsonApiTestHelper.make_json_body_response(
+        {
+            "errCode": "private-error-code",
+            "message": "private-message",
+            "token": "private-token",
+            "id": "private-session",
+        }
+    )
+    caplog.clear()
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        return_value=response,
+    ):
+        assert connector._json_api_login() is False
+
+    assert "login rejected: errCode=<str>" in caplog.text
+    for private_value in (
+        "private-switch.test",
+        "private-password",
+        "private-error-code",
+        "private-message",
+        "private-token",
+        "private-session",
+    ):
+        assert private_value not in caplog.text
+
+
+def test_json_api_session_registration_diagnostics_do_not_log_sensitive_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Report registration metadata without logging arbitrary response values."""
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
+    connector = NetgearSwitchConnector(
+        host="private-switch.test", password="private-password"
+    )
+    connector._set_instance_attributes_by_model(MS305E())
+    login_response = JsonApiTestHelper.make_json_body_response(
+        {
+            "errCode": 0,
+            "token": "private-token",
+            "id": "private-session",
+            "sessionmax": "private-sessionmax",
+            "timeout": "private-timeout",
+        }
+    )
+    session_response = JsonApiTestHelper.make_json_body_response(
+        {
+            "errCode": "private-registration-code",
+            "message": "private-message",
+        },
+        requests.codes.internal_server_error,
+    )
+    caplog.clear()
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=[login_response, session_response, session_response],
+    ):
+        assert connector._json_api_login() is False
+
+    assert "http_status=500 body_type=dict errCode=<str>" in caplog.text
+    assert "sessionmax=<str> timeout=<str>" in caplog.text
+    for private_value in (
+        "private-switch.test",
+        "private-password",
+        "private-registration-code",
+        "private-sessionmax",
+        "private-timeout",
+        "private-message",
+        "private-token",
+        "private-session",
+    ):
+        assert private_value not in caplog.text
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_login_retries_transient_session_registration_http_500(
+    caplog: pytest.LogCaptureFixture,
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Retry the observed transient registration failure once for MS30xE."""
+    caplog.set_level(logging.DEBUG, logger="py_netgear_plus")
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    login_response = JsonApiTestHelper.make_json_body_response(
+        {
+            "errCode": 0,
+            "token": "new-token",
+            "id": "new-session",
+            "sessionmax": False,
+            "timeout": 120,
+        }
+    )
+    server_error = Mock(status_code=requests.codes.internal_server_error)
+    server_error.json.side_effect = ValueError
+    session_response = JsonApiTestHelper.make_json_body_response({"errCode": 0})
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=[login_response, server_error, session_response],
+    ) as mock_json_request:
+        assert connector._json_api_login() is True
+
+    assert mock_json_request.call_args_list == [
+        call(
+            "patch",
+            "http://switch.test/api/system/login",
+            data={"password": "password"},
+        ),
+        call(
+            "post",
+            "http://switch.test/api/login_session",
+            data={"id": "new-session", "status": True},
+        ),
+        call(
+            "post",
+            "http://switch.test/api/login_session",
+            data={"id": "new-session", "status": True},
+        ),
+    ]
+    assert connector._page_fetcher.has_bearer_token() is True
+    assert connector._json_session_id == "new-session"
+    assert "session registration returned HTTP 500; retrying once" in caplog.text
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_login_stops_after_second_session_registration_http_500(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Keep the observed session-registration retry bounded to one retry."""
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    login_response = JsonApiTestHelper.make_json_body_response(
+        {
+            "errCode": 0,
+            "token": "new-token",
+            "id": "new-session",
+            "sessionmax": False,
+            "timeout": 120,
+        }
+    )
+    first_server_error = Mock(status_code=requests.codes.internal_server_error)
+    first_server_error.json.side_effect = ValueError
+    second_server_error = Mock(status_code=requests.codes.internal_server_error)
+    second_server_error.json.side_effect = ValueError
+
+    with patch.object(
+        connector._page_fetcher,
+        "json_request",
+        side_effect=[login_response, first_server_error, second_server_error],
+    ) as mock_json_request:
+        assert connector._json_api_login() is False
+
+    assert mock_json_request.call_count == 3
+    assert connector._page_fetcher.has_bearer_token() is False
+    assert connector._json_session_id is None
+    assert connector._json_session_refreshed_at is None
+
+
+@pytest.mark.parametrize("switch_model", JSON_API_MODEL_CLASSES)
+def test_json_api_fetch_continues_after_keepalive_connection_error(
+    switch_model: type[AutodetectedSwitchModel],
+) -> None:
+    """Allow the data request to proceed after a transient keepalive failure."""
+    helper = JsonApiTestHelper(switch_model.MODEL_NAME)
+    connector = NetgearSwitchConnector(host="switch.test", password="password")
+    connector._set_instance_attributes_by_model(switch_model())
+    connector._json_session_id = "active-session"
+    connector._json_session_refreshed_at = 0
+    port_response = helper.make_json_response(helper.data_dir / "0" / "ports.json")
+
+    with (
+        patch("py_netgear_plus.time.monotonic", return_value=60),
+        patch.object(
+            connector._page_fetcher,
+            "json_request",
+            side_effect=[PageFetcherConnectionError, port_response],
+        ),
+    ):
+        result = connector._json_api_fetch(switch_model.PORT_STATUS_TEMPLATES)
+
+    assert result is port_response
+    assert connector._json_session_refreshed_at == 0
 
 
 @pytest.mark.parametrize(
@@ -924,6 +1584,8 @@ def test_json_api_get_login_cookie(
         connector.autodetect_model()
         assert connector.get_login_cookie() is True
         assert connector._page_fetcher.has_bearer_token() is True
+        assert connector._json_session_id is not None
+        assert connector._json_session_refreshed_at is not None
         # Second call should return True without re-login
         assert connector.get_login_cookie() is True
 
@@ -947,6 +1609,8 @@ def test_json_api_delete_login_cookie(
     assert connector._page_fetcher.has_bearer_token() is True
     connector.delete_login_cookie()
     assert connector._page_fetcher.has_bearer_token() is False
+    assert connector._json_session_id is None
+    assert connector._json_session_refreshed_at is None
 
 
 @pytest.mark.parametrize(
